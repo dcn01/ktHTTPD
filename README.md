@@ -4,6 +4,6 @@ A very basic and lightweight HTTP server developed with Kotlin and targeting And
 
 Inspired in NanoHTTPD but using Kotlin features.
 Makes use of Coroutines to handle asynchronous tasks like handling requests.
-Will eventually be published as a library for use in other projects.
+Will eventually be usable for something but for now is just a playground for learning Kotlin.
 
 ## Still in very early stages of development and will probably never be RFC compliant.
