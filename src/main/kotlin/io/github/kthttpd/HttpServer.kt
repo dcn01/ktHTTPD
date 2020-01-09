@@ -1,59 +1,136 @@
 package io.github.kthttpd
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import java.io.PrintWriter
+import java.io.*
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import kotlin.system.measureTimeMillis
 
-data class Request(val command: String, val body: String)
+data class Request(val reader: BufferedReader) {
+    var headers = mutableMapOf<String, String>()
+    var command = ""
+    var method = ""
+    var version = ""
+    var path = "/"
+    var valid = false
 
-data class Response(val code: Int, val content: String)
+    init {
+        try {
+            readCommand()
+            readHeaders()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun readCommand() {
+        val line = try {
+            reader.readLine()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            ""
+        }
+        if (line.isNullOrBlank() || line == "\r\n" || !line.contains("HTTP/1.1"))
+            return
+        command = line
+        val parts = line.split(" ")
+        method = parts[0]
+        path = parts[1]
+        version = parts[2]
+        valid = true
+    }
+
+    private fun readHeaders(): MutableMap<String, String> {
+        var line = readHeaderLine()
+        while (line != null) {
+            line = readHeaderLine()
+            if (line != null)
+                headers.put(line.first, line.second)
+        }
+        return headers
+    }
+
+    private fun readHeaderLine(): Pair<String, String>? {
+        val line = reader.readLine()
+        if (line.isNullOrBlank() || line == "\r\n" || !line.contains(":"))
+            return null
+        val name = line.substring(0, line.indexOf(":")).trim()
+        val value = line.substring(line.indexOf(":") + 1, line.length).trim()
+        return name to value
+    }
+}
+
+class Response {
+    var code = 200
+    var mimetype = "text/plain"
+    var headers = mutableMapOf<String, String>()
+    var content: InputStream = "".byteInputStream()
+}
+
+fun log(msg: Any) {
+    println("[${Thread.currentThread().name}] > $msg")
+}
 
 open class HttpServer(private val hostname: String = "127.0.0.1", private val port: Int = 8080) {
-    companion object {
-        const val BUFFER_SIZE = 8192;
-    }
 
     init {
         log("Initializing ktHTTPd...")
     }
 
-    fun onRequest(callback: (Request) -> Response) {
-        log("Starting main thread...")
+    fun onRequest(callback: (request: Request, response: Response) -> Unit) {
         runBlocking {
+            log("Starting main coroutine...")
             withContext(Dispatchers.IO) {
                 val serverSocket = ServerSocket()
                 try {
                     log("Binding to $hostname:$port...")
                     serverSocket.bind(InetSocketAddress(hostname, port))
-                    log("Waiting for connections on URL: http://$hostname:$port/ ...")
+                    log("Waiting for requests on http://$hostname:$port/ ...")
                     while (!serverSocket.isClosed) {
-                        val clientSocket = serverSocket.accept()
-                        clientSocket.soTimeout = 10000
-                        //TODO handle each request on a separate coroutine
-                        val reader = clientSocket.getInputStream().bufferedReader()
-                        val command = reader.readLine()
-                        //validate HTTP request
-                        if (command.isNotEmpty() && "HTTP/1." in command) {
-                            log("Request from ${clientSocket.remoteSocketAddress}> $command")
-                            var raw = ""
-                            while (reader.ready()) {
-                                raw += reader.readLine() + "\n"
+                        try {
+                            val clientSocket = serverSocket.accept()
+                            //handle each request on a separate coroutine
+                            launch(Dispatchers.IO) {
+                                val execTime = measureTimeMillis {
+                                    val input = clientSocket.getInputStream()
+                                    val reader = input.bufferedReader()
+                                    val output = clientSocket.getOutputStream()
+                                    try {
+                                        clientSocket.soTimeout = 5000
+                                        clientSocket.tcpNoDelay = true
+                                        val request = Request(reader)
+                                        if (request.valid) {
+                                            val response = Response()
+                                            callback(request, response)
+                                            //build the response message
+                                            val writer = output.buffered()
+                                            writer.write("HTTP/1.1 ${response.code} \r\n".toByteArray())
+                                            writer.write("Content-Type: ${response.mimetype}\r\n".toByteArray())
+                                            for (header in response.headers)
+                                                writer.write("${header.key}: ${header.value}\r\n".toByteArray())
+                                            writer.write("\r\n".toByteArray())
+                                            response.content.copyTo(writer)
+                                            writer.close()
+                                        }
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                        log("Error: ${e.message}")
+                                    } finally {
+                                        reader.close()
+                                        input.close()
+                                        output.close()
+                                        clientSocket.close()
+                                    }
+                                }
+                                log("Request processed in $execTime ms")
                             }
-                            val response = callback(Request(command, raw))
-                            val writer = PrintWriter(clientSocket.getOutputStream())
-                            //send the response
-                            writer.print("HTTP/1.1 ${response.code} \r\n")
-                            writer.print("Content-Type: text/plain\r\n")
-                            writer.print("Connection: close\r\n")
-                            writer.print("\r\n")
-                            writer.print(response.content)
-                            writer.close()
-                            reader.close()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            log("Error: ${e.message}")
                         }
-                        clientSocket.close()
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -65,16 +142,13 @@ open class HttpServer(private val hostname: String = "127.0.0.1", private val po
         }
         log("Terminated main thread.")
     }
-
-    fun log(msg: Any) {
-        println("[${Thread.currentThread().name}] > $msg")
-    }
 }
 
 fun main() {
     var counter = 0
-    HttpServer().onRequest { request ->
-        println("SERVE: $request")
-        Response(200, "Hello world x${counter++}")
+    HttpServer().onRequest { request, response ->
+        log("SERVE: ${request.command} \n ${request.headers}")
+        response.headers.put("CustomHeader", "CustomHeaderValue")
+        response.content = "[${counter++}] Hello world".byteInputStream()
     }
 }
